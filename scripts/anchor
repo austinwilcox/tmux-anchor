@@ -1,0 +1,271 @@
+#!/usr/bin/env bash
+#
+# anchor - tmux file navigator inspired by ThePrimeagen's anchor for nvim
+#
+# Usage:
+#   anchor add [file]        Add a file to the anchor list
+#   anchor rm [file|index]   Remove a file by path or index (1-based)
+#   anchor list              Show all anchored files
+#   anchor go <index>        Open file at index in current tmux window
+#   anchor edit              Open the anchor list in $EDITOR for reordering/pruning
+#   anchor clear             Clear all anchored files
+#   anchor switch            Interactive fuzzy picker (fzf) to jump to a file
+
+set -euo pipefail
+
+ANCHOR_DIR="${ANCHOR_DIR:-$HOME/.config/anchor}"
+EDITOR="${EDITOR:-vim}"
+
+# Per-project lists keyed by working directory
+_list_file() {
+    local key
+    key=$(pwd | md5sum | cut -d' ' -f1)
+    echo "$ANCHOR_DIR/$key"
+}
+
+_ensure_dir() {
+    mkdir -p "$ANCHOR_DIR"
+    local f
+    f=$(_list_file)
+    touch "$f"
+    # Store the project path for reference
+    echo "$(pwd)" > "${f}.project"
+}
+
+_list_file_path() {
+    _ensure_dir
+    _list_file
+}
+
+_read_list() {
+    local f
+    f=$(_list_file_path)
+    cat "$f"
+}
+
+_write_list() {
+    local f
+    f=$(_list_file_path)
+    printf '%s' "$1" > "$f"
+}
+
+_resolve() {
+    # Turn a relative path into absolute
+    realpath -m "$1" 2>/dev/null || echo "$1"
+}
+
+_file_count() {
+    local f
+    f=$(_list_file_path)
+    local count
+    count=$(grep -c . "$f" 2>/dev/null || true)
+    echo "$count"
+}
+
+# ── Commands ──────────────────────────────────────────────────────────
+
+cmd_add() {
+    local file
+    file="${1:?Usage: anchor add <file>}"
+    file=$(_resolve "$file")
+
+    if [[ ! -e "$file" ]]; then
+        echo "anchor: warning: '$file' does not exist (adding anyway)" >&2
+    fi
+
+    local list
+    list=$(_read_list)
+
+    # Don't add duplicates
+    if echo "$list" | grep -qxF "$file"; then
+        echo "anchor: '$file' is already anchored"
+        return 0
+    fi
+
+    if [[ -z "$list" ]]; then
+        _write_list "$file"
+    else
+        _write_list "${list}
+${file}"
+    fi
+
+    local count
+    count=$(_file_count)
+    echo "anchor: added '$file' [$count]"
+}
+
+cmd_rm() {
+    local target="${1:?Usage: anchor rm <file|index>}"
+    local list
+    list=$(_read_list)
+
+    if [[ -z "$list" ]]; then
+        echo "anchor: list is empty"
+        return 1
+    fi
+
+    # If target is a number, treat as 1-based index
+    if [[ "$target" =~ ^[0-9]+$ ]]; then
+        local removed
+        removed=$(echo "$list" | sed -n "${target}p")
+        if [[ -z "$removed" ]]; then
+            echo "anchor: index $target out of range"
+            return 1
+        fi
+        local new_list
+        new_list=$(echo "$list" | sed "${target}d")
+        _write_list "$new_list"
+        echo "anchor: removed '$removed'"
+    else
+        target=$(_resolve "$target")
+        if ! echo "$list" | grep -qxF "$target"; then
+            echo "anchor: '$target' not in list"
+            return 1
+        fi
+        local new_list
+        new_list=$(echo "$list" | grep -vxF "$target")
+        _write_list "$new_list"
+        echo "anchor: removed '$target'"
+    fi
+}
+
+cmd_list() {
+    local list
+    list=$(_read_list)
+    if [[ -z "$list" ]]; then
+        echo "anchor: no files anchored (use 'anchor add <file>')"
+        return 0
+    fi
+    local i=1
+    while IFS= read -r line; do
+        printf "  %d  %s\n" "$i" "$line"
+        ((i++))
+    done <<< "$list"
+}
+
+cmd_go() {
+    local index="${1:?Usage: anchor go <index>}"
+    local list
+    list=$(_read_list)
+
+    if [[ -z "$list" ]]; then
+        echo "anchor: list is empty"
+        return 1
+    fi
+
+    local file
+    file=$(echo "$list" | sed -n "${index}p")
+    if [[ -z "$file" ]]; then
+        echo "anchor: index $index out of range"
+        return 1
+    fi
+
+    # If inside tmux, open in current pane's $EDITOR
+    if [[ -n "${TMUX:-}" ]]; then
+        tmux send-keys "$EDITOR '$file'" Enter
+    else
+        $EDITOR "$file"
+    fi
+}
+
+cmd_edit() {
+    local f
+    f=$(_list_file_path)
+    $EDITOR "$f"
+    # Remove any blank lines the user may have left
+    local cleaned
+    cleaned=$(sed '/^[[:space:]]*$/d' "$f")
+    _write_list "$cleaned"
+    echo "anchor: list updated"
+}
+
+cmd_clear() {
+    _write_list ""
+    echo "anchor: list cleared"
+}
+
+cmd_switch() {
+    if ! command -v fzf &>/dev/null; then
+        echo "anchor: fzf is required for 'switch' (https://github.com/junegunn/fzf)" >&2
+        return 1
+    fi
+
+    local list
+    list=$(_read_list)
+    if [[ -z "$list" ]]; then
+        echo "anchor: list is empty"
+        return 1
+    fi
+
+    local numbered
+    numbered=$(echo "$list" | nl -ba -w2 -s'  ')
+
+    local choice
+    choice=$(echo "$numbered" | fzf --prompt="anchor> " --height=40% --reverse) || return 0
+    local index
+    index=$(echo "$choice" | awk '{print $1}')
+
+    cmd_go "$index"
+}
+
+# ── Tmux keybinding helpers ──────────────────────────────────────────
+
+cmd_bind() {
+    cat << 'BINDEOF'
+# Add these to your ~/.tmux.conf for quick navigation:
+#
+# Add current file (requires shell function, see install instructions)
+# bind-key a run-shell "anchor add #{pane_current_path}"
+#
+# Jump to anchored files 1-5:
+# bind-key M-1 run-shell "anchor go 1"
+# bind-key M-2 run-shell "anchor go 2"
+# bind-key M-3 run-shell "anchor go 3"
+# bind-key M-4 run-shell "anchor go 4"
+# bind-key M-5 run-shell "anchor go 5"
+#
+# Open interactive switcher:
+# bind-key M-h run-shell "anchor switch"
+BINDEOF
+}
+
+# ── Main ─────────────────────────────────────────────────────────────
+
+main() {
+    local cmd="${1:-}"
+    shift || true
+
+    case "$cmd" in
+        add)    cmd_add "$@" ;;
+        rm)     cmd_rm "$@" ;;
+        list|ls) cmd_list "$@" ;;
+        go)     cmd_go "$@" ;;
+        edit)   cmd_edit "$@" ;;
+        clear)  cmd_clear "$@" ;;
+        switch|sw) cmd_switch "$@" ;;
+        bind)   cmd_bind ;;
+        ""|help|-h|--help)
+            cat << 'EOF'
+anchor - tmux file navigator
+
+Usage:
+  anchor add <file>        Add a file to the anchor list
+  anchor rm <file|index>   Remove a file by path or 1-based index
+  anchor list              Show all anchored files
+  anchor go <index>        Open file at index in $EDITOR via tmux
+  anchor edit              Open the anchor list in $EDITOR to reorder/prune
+  anchor switch            Interactive fzf picker
+  anchor clear             Clear all anchored files
+  anchor bind              Show suggested tmux keybindings
+
+Files are stored per-directory in ~/.config/anchor/
+EOF
+            ;;
+        *)
+            echo "anchor: unknown command '$cmd' (try 'anchor help')" >&2
+            return 1
+            ;;
+    esac
+}
+
+main "$@"
