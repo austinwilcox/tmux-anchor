@@ -9,7 +9,7 @@ A tmux file navigator inspired by [ThePrimeagen's harpoon](https://github.com/Th
 Add to your `~/.tmux.conf`:
 
 ```tmux
-set -g @plugin 'yourusername/tmux-anchor'
+set -g @plugin 'austinwilcox/tmux-anchor'
 ```
 
 Then press `prefix + I` to install.
